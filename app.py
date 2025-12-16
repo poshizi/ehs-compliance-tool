@@ -1,0 +1,253 @@
+import streamlit as st
+import pandas as pd
+import os
+import re
+import zipfile
+import io
+
+# ====================
+# 核心逻辑函数 (复用专家经验)
+# ====================
+
+def extract_text_from_file(uploaded_file):
+    """从上传的文件(docx/xlsx)中提取纯文本"""
+    text = ""
+    try:
+        file_name = uploaded_file.name
+        content = uploaded_file.getvalue()
+        
+        if file_name.endswith('.docx'):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                xml = zf.read('word/document.xml').decode('utf-8')
+                text = re.sub(r'<[^>]+>', '', xml)
+        elif file_name.endswith('.xlsx'):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                if 'xl/sharedStrings.xml' in zf.namelist():
+                    xml = zf.read('xl/sharedStrings.xml').decode('utf-8')
+                    text = re.sub(r'<[^>]+>', '', xml)
+    except Exception as e:
+        st.error(f"解析文件 {uploaded_file.name} 失败: {str(e)}")
+    return text
+
+def parse_regulation_clauses(text):
+    """将法规文本拆解为条款列表"""
+    # 匹配 "第X条" 的模式，支持中文数字
+    pattern = r'(第[零一二三四五六七八九十百]+条)'
+    parts = re.split(pattern, text)
+    
+    clauses = []
+    if len(parts) > 1:
+        # parts[0] 是前言，parts[1]是"第一条", parts[2]是内容...
+        for i in range(1, len(parts), 2):
+            title = parts[i]
+            content = parts[i+1].strip() if i+1 < len(parts) else ""
+            
+            # 简单的适用性判断逻辑（排除纯政府职责）
+            applicability = "适用"
+            gov_keywords = ["国务院", "县级以上", "监察机关", "人民政府", "主管部门"]
+            # 如果主要是在讲政府应该做什么，且没有提及“生产经营单位”
+            if any(k in content[:20] for k in gov_keywords) and "生产经营单位" not in content[:50]:
+                applicability = "不适用(政府职责)"
+            
+            full_text = title + " " + content
+            clauses.append({
+                "条款号": title,
+                "法规正文": full_text,
+                "适用性": applicability
+            })
+    return clauses
+
+def calculate_match_score(clause_text, policy_text):
+    """计算匹配度得分 (基于简单的关键词重叠)"""
+    # 简单的分词：按标点符号分割
+    keywords = re.split(r'[，。；：、“”]', clause_text)
+    keywords = [k for k in keywords if len(k) > 2] # 仅保留有意义的词
+    
+    score = 0
+    matched_words = []
+    
+    for k in keywords:
+        if k in policy_text:
+            score += len(k)
+            matched_words.append(k)
+            
+    return score, list(set(matched_words))
+
+def analyze_compliance(reg_files, policy_files, progress_bar, status_text):
+    """执行合规性分析的主流程"""
+    
+    # 1. 预处理制度文件库
+    status_text.text("正在构建制度知识库...")
+    policy_corpus = []
+    total_policies = len(policy_files)
+    
+    for idx, p_file in enumerate(policy_files):
+        p_text = extract_text_from_file(p_file)
+        if p_text:
+            policy_corpus.append({
+                "name": p_file.name,
+                "content": p_text
+            })
+        progress_bar.progress((idx + 1) / total_policies * 0.1) # 预处理占10%进度
+
+    all_results = []
+    
+    # 2. 逐个分析法规文件
+    for r_file in reg_files:
+        r_text = extract_text_from_file(r_file)
+        clauses = parse_regulation_clauses(r_text)
+        
+        total_clauses = len(clauses)
+        if total_clauses == 0:
+            st.warning(f"文件 {r_file.name} 未识别到有效条款，请确认格式。")
+            continue
+            
+        current_results = []
+        
+        for idx, clause in enumerate(clauses):
+            # 更新进度条
+            progress = 0.1 + ((idx + 1) / total_clauses * 0.9)
+            progress_bar.progress(progress)
+            status_text.text(f"正在分析 {r_file.name}: {clause['条款号']}...")
+            
+            row = {
+                "序号": idx + 1,
+                "法规文件": r_file.name,
+                "条款号": clause['条款号'],
+                "法规正文": clause['法规正文'],
+                "评价结论": "❌缺失/不符合", # 默认
+                "支撑证据": "未检索到相关制度",
+                "匹配度": 0
+            }
+            
+            if clause['适用性'] != "适用":
+                row['评价结论'] = "❗不适用"
+                row['支撑证据'] = "条款主体非企业"
+            else:
+                # 在制度库中寻找最佳匹配
+                best_score = 0
+                best_match = None
+                best_keywords = []
+                
+                for policy in policy_corpus:
+                    score, keywords = calculate_match_score(clause['法规正文'], policy['content'])
+                    if score > best_score:
+                        best_score = score
+                        best_match = policy
+                        best_keywords = keywords
+                
+                # 判定逻辑
+                if best_score > 0:
+                    row['匹配度'] = best_score
+                    # 提取匹配片段
+                    idx = best_match['content'].find(best_keywords[0])
+                    start = max(0, idx - 20)
+                    end = min(len(best_match['content']), idx + 100)
+                    snippet = best_match['content'][start:end] + "..."
+                    
+                    row['支撑证据'] = f"[{best_match['name']}]\n相关内容: ...{snippet}"
+                    
+                    if best_score > 30: # 阈值可调
+                        row['评价结论'] = "✅完全符合"
+                    elif best_score > 10:
+                        row['评价结论'] = "⚠️部分符合/需完善"
+                
+            current_results.append(row)
+        
+        all_results.extend(current_results)
+        
+    return pd.DataFrame(all_results)
+
+# ====================
+# Streamlit UI 界面
+# ====================
+
+st.set_page_config(page_title="EHS合规性智能评价助手", layout="wide")
+
+st.title("🛡️ EHS法规合规性智能评价助手")
+st.markdown("""
+本工具用于自动比对 **外部法规** 与 **内部制度**，生成合规性评价矩阵。
+请在左侧侧边栏上传相应的文件。
+""")
+
+# --- 侧边栏：文件上传 ---
+with st.sidebar:
+    st.header("📂 文件上传区")
+    
+    st.subheader("1. 上传法规文件 (标准)")
+    reg_files = st.file_uploader("支持 .docx (如: 安全法.docx)", type=['docx'], accept_multiple_files=True, key="reg")
+    
+    st.subheader("2. 上传制度文件 (依据)")
+    policy_files = st.file_uploader("支持 .docx, .xlsx (如: 管理手册)", type=['docx', 'xlsx'], accept_multiple_files=True, key="pol")
+    
+    st.info("提示：文件越多，分析时间越长，请耐心等待。")
+
+# --- 主界面：分析控制与展示 ---
+
+if reg_files and policy_files:
+    if st.button("🚀 开始合规性匹配分析", type="primary"):
+        # 进度条容器
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # 执行分析
+            df_result = analyze_compliance(reg_files, policy_files, progress_bar, status_text)
+            
+            status_text.text("✅ 分析完成！")
+            progress_bar.progress(100)
+            
+            # 展示结果统计
+            st.divider()
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("分析条款总数", len(df_result))
+            with col2:
+                st.metric("完全符合", len(df_result[df_result['评价结论'] == "✅完全符合"]))
+            with col3:
+                st.metric("部分符合", len(df_result[df_result['评价结论'] == "⚠️部分符合/需完善"]))
+            with col4:
+                st.metric("不适用/缺失", len(df_result[~df_result['评价结论'].str.contains("符合")]))
+            
+            # 展示详细表格
+            st.subheader("📊 合规性评价矩阵 (第二部分表格)")
+            
+            # 增加筛选功能
+            filter_status = st.multiselect(
+                "筛选评价结论:",
+                options=df_result['评价结论'].unique(),
+                default=df_result['评价结论'].unique()
+            )
+            
+            df_display = df_result[df_result['评价结论'].isin(filter_status)]
+            st.dataframe(
+                df_display, 
+                use_container_width=True,
+                height=600,
+                column_config={
+                    "法规正文": st.column_config.TextColumn("法规正文", width="medium"),
+                    "支撑证据": st.column_config.TextColumn("支撑证据", width="large"),
+                }
+            )
+            
+            # 导出功能
+            st.subheader("📥 导出报告")
+            
+            # CSV 下载
+            csv = df_result.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="下载 CSV 格式报告",
+                data=csv,
+                file_name="EHS合规性评价报告.csv",
+                mime="text/csv",
+            )
+            
+        except Exception as e:
+            st.error(f"分析过程中发生错误: {str(e)}")
+            st.exception(e)
+
+else:
+    st.info("👈 请先在左侧侧边栏上传至少一个法规文件和一个制度文件。")
+
+st.divider()
+st.caption("Powered by Gemini EHS Compliance Engine | 2025")
