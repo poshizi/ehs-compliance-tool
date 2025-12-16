@@ -27,11 +27,9 @@ if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
 # ====================
-# Lightweight WebDAV Client (With Folder Support)
+# Lightweight WebDAV Client
 # ====================
-
 class SimpleWebDavClient:
-    """基于 requests 的轻量级 WebDAV 客户端"""
     def __init__(self, base_url, username, password):
         self.base_url = base_url.rstrip('/') 
         self.auth = (username, password)
@@ -39,10 +37,8 @@ class SimpleWebDavClient:
         self.session.auth = self.auth
     
     def list(self, path="/"):
-        """列出指定路径下的文件和文件夹"""
         path = path.strip('/')
         full_url = f"{self.base_url}/{path}/" if path else f"{self.base_url}/"
-        
         headers = {'Depth': '1'}
         try:
             response = self.session.request('PROPFIND', full_url, headers=headers)
@@ -54,8 +50,6 @@ class SimpleWebDavClient:
             raise Exception(f"Connection failed: {str(e)}")
 
     def download(self, path):
-        """下载文件内容"""
-        # path 是相对于 base_url 的路径
         full_url = f"{self.base_url}/{quote(path.strip('/'))}"
         response = self.session.get(full_url)
         if response.status_code == 200:
@@ -64,45 +58,21 @@ class SimpleWebDavClient:
             raise Exception(f"Download failed: {response.status_code}")
 
     def _parse_propfind(self, xml_content, current_url):
-        """解析 XML 响应获取文件列表，区分文件和文件夹"""
         items = []
         try:
             root = ET.fromstring(xml_content)
-            # 处理 namespace，WebDAV 响应通常带有复杂的 namespace
-            # 简单处理：忽略 namespace 直接查找 local name
             for response in root.findall('.//{DAV:}response'):
                 href = response.find('.//{DAV:}href').text
                 href = unquote(href)
-                
-                # 判断是否是集合 (文件夹)
                 resourcetype = response.find('.//{DAV:}resourcetype')
                 is_collection = False
                 if resourcetype is not None:
                     if resourcetype.find('.//{DAV:}collection') is not None:
                         is_collection = True
-                
-                # 提取相对路径/名称
-                # href 通常是 /dav/folder/file.docx
-                # 我们需要提取出显示名称
                 name = href.rstrip('/').split('/')[-1]
-                
-                # 过滤掉当前目录本身
-                # 比较 href 和 current_url 的路径部分是否一致
-                # 这里简单比对 name 是否为空 (根目录) 或 href 是否等于 current_url
-                
                 if not name: continue 
-                
-                items.append({
-                    'name': name,
-                    'path': href, # 保留完整 href 用于导航
-                    'is_folder': is_collection
-                })
-        except Exception as e:
-            print(f"XML Parsing Error: {e}")
-            pass
-        
-        # 过滤掉当前目录自己 (通常它是列表的第一个，且名字和当前目录一样)
-        # 这里做一个简单的去重逻辑：如果列表里有 path 结尾和请求 path 一样的，去掉
+                items.append({'name': name, 'path': href, 'is_folder': is_collection})
+        except Exception as e: pass
         return items
 
 # ====================
@@ -110,7 +80,6 @@ class SimpleWebDavClient:
 # ====================
 
 class LLMClient:
-    """处理与大模型的交互 (Embedding 和 Chat)"""
     def __init__(self, config):
         self.base_url = config.get('base_url', '').rstrip('/')
         self.api_key = config.get('api_key')
@@ -124,37 +93,23 @@ class LLMClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def get_embedding(self, text):
-        """获取文本的向量表示"""
         if self.embedding_failed: return None
-        
-        payload = {
-            "input": text.replace("\n", " "),
-            "model": self.embedding_model
-        }
+        payload = {"input": text.replace("\n", " "), "model": self.embedding_model}
         url = f"{self.base_url}/embeddings"
-        
         try:
             response = requests.post(url, headers=self.headers, json=payload, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if 'data' in data and len(data['data']) > 0:
                     return data['data'][0]['embedding']
-            else:
-                print(f"Embedding failed: {response.status_code}")
-                return None
-        except Exception as e:
-            print(f"Embedding error: {e}")
             return None
+        except Exception: return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def chat_completion(self, system_prompt, user_prompt):
-        """调用 Chat 接口"""
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             "temperature": 0.1,
             "response_format": {"type": "json_object"}
         }
@@ -177,35 +132,33 @@ class LLMClient:
         except Exception as e: results['msg'] += f"Chat Error: {e}\n"
         try:
             if self.get_embedding("test"): results['embedding'] = True
-            else: results['msg'] += "Embedding Error: None (Check model)\n"
+            else: results['msg'] += "Embedding Error: None\n"
         except Exception as e: results['msg'] += f"Embedding Exception: {e}\n"
         return results
 
 class VectorStore:
-    """持久化向量数据库 (支持制度库 + 法规库)"""
     def __init__(self):
-        self.documents = []   # 制度文档
-        self.vectors = []     # 制度向量
-        self.regulations = [] # 法规文档 (缓存用)
+        self.documents = []   # [{'id', 'text', 'source', 'keywords', 'original_idx'}, ...]
+        self.vectors = []     
+        self.regulations = [] 
+        self.eval_cache = {}  # {hash: result}
         self.llm_client = None
 
     def set_client(self, client):
         self.llm_client = client
 
     def save_to_disk(self, name="default"):
-        """保存完整库 (制度 + 法规)"""
         path = os.path.join(CACHE_DIR, f"{name}.pkl")
         data = {
             "documents": self.documents,
             "vectors": self.vectors,
-            "regulations": self.regulations
+            "regulations": self.regulations,
+            "eval_cache": self.eval_cache
         }
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
+        with open(path, "wb") as f: pickle.dump(data, f)
         return path
 
     def load_from_disk(self, name="default"):
-        """加载库"""
         path = os.path.join(CACHE_DIR, f"{name}.pkl")
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -213,13 +166,12 @@ class VectorStore:
                 self.documents = data.get("documents", [])
                 self.vectors = data.get("vectors", [])
                 self.regulations = data.get("regulations", [])
+                self.eval_cache = data.get("eval_cache", {})
             return True
         return False
 
     def add_documents(self, file_corpus):
-        """添加制度文档并向量化"""
-        chunk_size = 500
-        overlap = 50 
+        """智能按段落切片"""
         new_docs = []
         texts_to_embed = []
         start_doc_id = len(self.documents)
@@ -227,20 +179,33 @@ class VectorStore:
         for file in file_corpus:
             if any(d['source'] == file['name'] for d in self.documents): continue
             
-            text = file['content']
-            for i in range(0, len(text), chunk_size - overlap):
-                chunk = text[i:i + chunk_size]
-                if len(chunk) < 50: continue 
-                keywords = set(re.split(r'[，。；：\s]', chunk))
-                keywords = [k for k in keywords if len(k) > 1]
-                new_docs.append({'id': start_doc_id, 'text': chunk, 'source': file['name'], 'keywords': keywords})
-                texts_to_embed.append(chunk)
+            # Smart Chunking: 按换行符分割，合并成 approx 600 chars
+            paragraphs = file['content'].split('\n')
+            current_chunk = ""
+            
+            for para in paragraphs:
+                para = para.strip()
+                if not para: continue
+                
+                if len(current_chunk) + len(para) < 600:
+                    current_chunk += para + "\n"
+                else:
+                    if len(current_chunk) > 50: # Avoid tiny chunks
+                        new_docs.append(self._create_doc_obj(start_doc_id, current_chunk, file['name']))
+                        texts_to_embed.append(current_chunk)
+                        start_doc_id += 1
+                    current_chunk = para + "\n"
+            
+            # Last chunk
+            if len(current_chunk) > 30:
+                new_docs.append(self._create_doc_obj(start_doc_id, current_chunk, file['name']))
+                texts_to_embed.append(current_chunk)
                 start_doc_id += 1
-        
+
         if not texts_to_embed: return
 
         if self.llm_client:
-            with st.status(f"正在向量化 {len(texts_to_embed)} 个新制度片段...") as status:
+            with st.status(f"正在智能向量化 {len(texts_to_embed)} 个新片段...") as status:
                 new_vectors = [None] * len(texts_to_embed)
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     future_to_idx = {executor.submit(self.llm_client.get_embedding, t): i for i, t in enumerate(texts_to_embed)}
@@ -252,18 +217,50 @@ class VectorStore:
                 self.vectors = (list(self.vectors) if len(self.vectors)>0 else []) + new_vectors
                 status.update(label="制度入库完成", state="complete")
 
+    def _create_doc_obj(self, doc_id, text, source):
+        keywords = set(re.split(r'[，。；：\s]', text))
+        keywords = [k for k in keywords if len(k) > 1]
+        return {'id': doc_id, 'text': text, 'source': source, 'keywords': keywords}
+
     def add_regulations(self, file_corpus):
-        """添加法规文档 (无需向量化，仅解析保存)"""
         count = 0
         for file in file_corpus:
-            # 查重
             if any(r['name'] == file['name'] for r in self.regulations): continue
-            self.regulations.append(file) # file: {'name': name, 'content': text}
+            self.regulations.append(file)
             count += 1
         return count
 
+    def get_context_window(self, doc_id):
+        """获取指定doc_id的前后文"""
+        # 寻找 doc_id 在 documents 列表中的 index
+        # 假设 doc_id 是连续增加的，但这不一定靠谱如果删除了文档
+        # 我们用 list 查找
+        target_idx = -1
+        for i, d in enumerate(self.documents):
+            if d['id'] == doc_id:
+                target_idx = i
+                break
+        
+        if target_idx == -1: return ""
+        
+        current_doc = self.documents[target_idx]
+        context = current_doc['text']
+        
+        # 找前一个
+        if target_idx > 0:
+            prev_doc = self.documents[target_idx - 1]
+            if prev_doc['source'] == current_doc['source']: # 必须同源
+                context = prev_doc['text'] + "\n[...上下文连接...]\n" + context
+        
+        # 找后一个
+        if target_idx < len(self.documents) - 1:
+            next_doc = self.documents[target_idx + 1]
+            if next_doc['source'] == current_doc['source']:
+                context = context + "\n[...上下文连接...]\n" + next_doc['text']
+                
+        return context
+
     def search(self, query_text, top_k=3):
-        """混合检索 (仅针对制度库)"""
         vec_results = []
         valid_indices = [i for i, v in enumerate(self.vectors) if v is not None]
         
@@ -280,27 +277,26 @@ class VectorStore:
                     for idx_in_valid in top_k_indices:
                         real_idx = valid_indices[idx_in_valid]
                         score = scores[idx_in_valid]
-                        if score > 0: vec_results.append({'doc': self.documents[real_idx], 'score': float(score), 'method': 'vector'})
+                        if score > 0.1: # 稍微提高纯向量阈值
+                            vec_results.append({'doc': self.documents[real_idx], 'score': float(score), 'method': 'vector'})
 
         kw_results = []
         query_keywords = [k for k in re.split(r'[，。；：\s]', query_text) if len(k) > 1]
         for doc in self.documents:
             overlap = sum(1 for k in query_keywords if k in doc['keywords']) 
             if overlap > 0:
-                score = overlap / (len(query_keywords) + 1) * 0.8 
+                score = overlap / (len(query_keywords) + 1) * 0.9 # 提高关键词权重
                 kw_results.append({'doc': doc, 'score': score, 'method': 'keyword'})
         
-        kw_results.sort(key=lambda x: x['score'], reverse=True)
-        kw_results = kw_results[:top_k]
-
         combined = vec_results + kw_results
+        combined.sort(key=lambda x: x['score'], reverse=True)
+        
         seen_ids = set()
         final_results = []
-        combined.sort(key=lambda x: x['score'], reverse=True)
         for res in combined:
             did = res['doc']['id']
             if did not in seen_ids:
-                final_results.append({'source': res['doc']['source'], 'content': res['doc']['text'], 'score': res['score']})
+                final_results.append(res)
                 seen_ids.add(did)
             if len(final_results) >= top_k: break
         return final_results
@@ -350,30 +346,47 @@ def parse_regulation_clauses(text):
     return clauses
 
 def evaluate_single_clause(clause, vector_store, llm_client):
-    row = {"条款号": clause['条款号'], "法规正文": clause['法规正文'], "评价结论": "❌缺失/不符合", "差距分析": "未检索到相关制度", "改进建议": "请补充相关管理规定", "支撑证据": "无", "匹配度": 0.0}
-
+    """专家评估核心 (带缓存与上下文增强)"""
+    
+    # 1. 检索
     search_results = vector_store.search(clause['法规正文'], top_k=3)
     top_score = search_results[0]['score'] if search_results else 0
-    row['匹配度'] = top_score
-        
+    
+    # 2. 构造 Evidence Context (增强版)
     evidence_text = ""
+    evidence_signature = "" # 用于缓存的 key
+    
     if search_results:
         for i, res in enumerate(search_results):
-            evidence_text += f"参考制度片段 {i+1} (来源: {res['source']}):\n{res['content'][:800]}\n---\n"
+            # 获取上下文 (Context Window)
+            expanded_text = vector_store.get_context_window(res['doc']['id'])
+            evidence_text += f"参考制度片段 {i+1} (来源: {res['doc']['source']}):\n{expanded_text[:1200]}\n---\n"
+            evidence_signature += f"{res['doc']['id']}-"
     else:
         evidence_text = "未检索到任何相关的企业内部制度文档。"
-    
+        evidence_signature = "None"
+        
+    # 3. 检查缓存
+    cache_key = hashlib.md5((clause['法规正文'] + evidence_signature).encode()).hexdigest()
+    if cache_key in vector_store.eval_cache:
+        # 命中缓存
+        cached_row = vector_store.eval_cache[cache_key]
+        cached_row['匹配度'] = top_score # 更新分数以防算法微调
+        return cached_row
+
+    row = {"条款号": clause['条款号'], "法规正文": clause['法规正文'], "评价结论": "❌缺失/不符合", "差距分析": "未检索到相关制度", "改进建议": "请补充相关管理规定", "支撑证据": "无", "匹配度": top_score}
+
     system_prompt = """你是一名具有20年经验的EHS管理专家，精通中国EHS法规标准，擅长仓储物流场景。
     请对给定的法规条款进行合规性评价。严格执行以下思维链：
     1. 解读：理解条款核心要求（人机料法环），判定是否适用于物流仓储企业。如果不适用，直接标记“不适用”。
-    2. 比对：对比法规要求与提供的企业制度片段。是否覆盖所有要素？针对物流场景是否具体可执行？
+    2. 比对：对比法规要求与提供的企业制度片段。注意：制度片段可能包含上下文。
     3. 判定：给出定性结论。"""
     
     user_prompt = f"""
     【法规条款】
     {clause['法规正文']}
 
-    【企业制度现状（检索到的最相关片段）】
+    【企业制度现状（包含上下文）】
     {evidence_text}
 
     【任务要求】
@@ -398,6 +411,10 @@ def evaluate_single_clause(clause, vector_store, llm_client):
         row['差距分析'] = result.get('gap_analysis', '无分析')
         row['改进建议'] = result.get('improvement_suggestion', '无建议')
         row['支撑证据'] = result.get('evidence_summary', '无')
+        
+        # 写入缓存
+        vector_store.eval_cache[cache_key] = row
+        
     except Exception as e:
         row['差距分析'] = f"LLM分析失败: {str(e)}"
     return row
@@ -408,10 +425,8 @@ def generate_word_report(df_results, summary_stats):
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph(f"评价日期: {time.strftime('%Y-%m-%d')}")
     
-    # 1. 总体评价 - 系统性汇总
     doc.add_heading('第一部分：总体评价与管理建议', level=1)
     
-    # 1.1 数据概览
     doc.add_heading('1.1 评价数据概览', level=2)
     p = doc.add_paragraph()
     p.add_run(f"本次评价共分析法规条款 {summary_stats['total']} 条，其中：\n")
@@ -419,7 +434,6 @@ def generate_word_report(df_results, summary_stats):
     p.add_run(f"⚠️ 部分符合/需完善: {summary_stats['partial']} 条 ({summary_stats['partial']/summary_stats['total']*100:.1f}%)\n").font.color.rgb = RGBColor(255, 165, 0)
     p.add_run(f"❌ 缺失/不符合: {summary_stats['non_compliant']} 条 ({summary_stats['non_compliant']/summary_stats['total']*100:.1f}%)\n").font.color.rgb = RGBColor(255, 0, 0)
     
-    # 1.2 关键风险领域
     doc.add_heading('1.2 关键风险领域识别', level=2)
     risk_df = df_results[df_results['评价结论'].str.contains("缺失|不符合|部分")]
     if not risk_df.empty:
@@ -432,7 +446,7 @@ def generate_word_report(df_results, summary_stats):
             cell.text = h
             cell.paragraphs[0].runs[0].font.bold = True
         
-        for idx, row in risk_df.head(10).iterrows(): # 仅列出前10条避免过长
+        for idx, row in risk_df.head(10).iterrows(): 
             r = risk_table.add_row().cells
             r[0].text = row['条款号']
             r[1].text = row['差距分析']
@@ -440,19 +454,17 @@ def generate_word_report(df_results, summary_stats):
         if len(risk_df) > 10:
             doc.add_paragraph(f"...(另有 {len(risk_df)-10} 条风险条款，详见附表)")
     else:
-        doc.add_paragraph("本次评价未发现重大合规风险，制度体系整体运行良好。")
+        doc.add_paragraph("本次评价未发现重大合规风险。")
 
-    # 1.3 专家结论
     doc.add_heading('1.3 专家综合结论', level=2)
     if summary_stats['non_compliant'] > 5:
-        conclusion = "结论：企业现行制度在核心要素上存在明显缺失，合规风险较高。建议立即启动专项整改，优先完善上述识别出的风险领域，特别是针对物流现场作业的管控规定。"
+        conclusion = "结论：企业现行制度在核心要素上存在明显缺失，合规风险较高。建议立即启动专项整改。"
     elif summary_stats['partial'] > 5:
-        conclusion = "结论：企业制度框架基本健全，但在执行细节和具体落地措施上仍有优化空间。建议针对“需完善”条款进行修订，细化管理流程和责任人。"
+        conclusion = "结论：企业制度框架基本健全，但在执行细节上仍有优化空间。"
     else:
-        conclusion = "结论：企业EHS管理制度体系健全，与法规要求匹配度高。建议定期回顾更新，保持持续合规。"
+        conclusion = "结论：企业EHS管理制度体系健全。建议定期回顾更新。"
     doc.add_paragraph(conclusion)
 
-    # 2. 详细矩阵
     doc.add_heading('第二部分：详细合规性评价矩阵', level=1)
     table = doc.add_table(rows=1, cols=6)
     table.style = 'Table Grid'
@@ -485,6 +497,7 @@ if 'vector_store' not in st.session_state: st.session_state.vector_store = Vecto
 if 'current_webdav_path' not in st.session_state: st.session_state.current_webdav_path = "/"
 
 st.title("🛡️ EHS法规合规性智能评价系统 (Enterprise)")
+st.caption("v2.1 | 智能分段 | 上下文增强 | 结果缓存 | 风险洞察")
 
 with st.sidebar:
     st.header("1. API 配置")
@@ -501,9 +514,9 @@ with st.sidebar:
                 cfg = {"base_url": llm_base_url, "api_key": llm_api_key, "model": llm_model_name, "embedding_model": embedding_model_name}
                 client = LLMClient(cfg)
                 res = client.test_connection()
-                if res['chat']: st.success(f"✅ Chat ({llm_model_name}): 通畅")
+                if res['chat']: st.success(f"✅ Chat: 通畅")
                 else: st.error(f"❌ Chat 失败: {res['msg']}")
-                if res['embedding']: st.success(f"✅ Embedding ({embedding_model_name}): 通畅")
+                if res['embedding']: st.success(f"✅ Embedding: 通畅")
                 else: st.error(f"❌ Embedding 失败: {res['msg']}")
 
     if llm_api_key:
@@ -524,8 +537,12 @@ with st.sidebar:
             if st.session_state.vector_store.load_from_disk(db_name):
                 st.success(f"已加载!")
             else: st.error("文件不存在")
+            
+    if st.button("🗑️ 清空缓存"):
+        st.session_state.vector_store.eval_cache = {}
+        st.success("评估结果缓存已清空")
 
-st.info(f"📚 当前知识库: 制度片段 {len(st.session_state.vector_store.documents)} 个 | 已存法规 {len(st.session_state.vector_store.regulations)} 个")
+st.info(f"📚 当前知识库: 制度片段 {len(st.session_state.vector_store.documents)} 个 | 已存法规 {len(st.session_state.vector_store.regulations)} 个 | 缓存结果 {len(st.session_state.vector_store.eval_cache)} 条")
 
 tab1, tab2, tab3 = st.tabs(["📂 本地上传", "☁️ WebDAV 远程库", "🚀 开始评估"])
 
@@ -534,7 +551,7 @@ with tab1:
     with col_u1:
         st.subheader("上传制度 (依据)")
         policy_files_local = st.file_uploader("制度文件", type=['docx', 'xlsx', 'zip'], accept_multiple_files=True, key="pol_local", label_visibility="collapsed")
-        if st.button("📥 制度入库 (向量化)"):
+        if st.button("📥 制度入库"):
             if policy_files_local:
                 corpus = []
                 for name, content in process_uploaded_files(policy_files_local):
@@ -545,7 +562,7 @@ with tab1:
     with col_u2:
         st.subheader("上传法规 (标准)")
         reg_files_local = st.file_uploader("法规文件", type=['docx', 'zip'], accept_multiple_files=True, key="reg_local", label_visibility="collapsed")
-        if st.button("📥 法规入库 (解析保存)"):
+        if st.button("📥 法规入库"):
             if reg_files_local:
                 corpus = []
                 for name, content in process_uploaded_files(reg_files_local):
@@ -569,7 +586,6 @@ with tab2:
             st.session_state.wd_client = wd_client
         except Exception as e: st.error(f"连接失败: {e}")
 
-    # 导航栏
     if 'webdav_items' in st.session_state:
         st.markdown(f"**当前路径**: `{st.session_state.current_webdav_path}`")
         if st.session_state.current_webdav_path != "/":
@@ -578,7 +594,6 @@ with tab2:
                 st.session_state.current_webdav_path = parent if parent else "/"
                 st.rerun()
 
-        # 文件夹列表
         folders = [i for i in st.session_state.webdav_items if i['is_folder']]
         files = [i for i in st.session_state.webdav_items if not i['is_folder'] and i['name'].endswith(('.docx', '.xlsx', '.zip'))]
         
@@ -587,14 +602,10 @@ with tab2:
             cols = st.columns(4)
             for i, f in enumerate(folders):
                 if cols[i % 4].button(f"📂 {f['name']}", key=f['path']):
-                    # 这里 path 可能是完整 URL 或者是相对路径，取决于服务器返回
-                    # 我们需要提取相对路径
-                    # 简单点：直接用 name 拼接到 current_path
                     new_path = f"{st.session_state.current_webdav_path.rstrip('/')}/{f['name']}"
                     st.session_state.current_webdav_path = new_path
                     st.rerun()
 
-        # 文件列表
         st.markdown("#### 📄 文件")
         selected_wd_files = st.multiselect("选择文件", [f['name'] for f in files])
         action = st.radio("操作:", ["制度入库 (向量化)", "法规入库 (保存)"])
@@ -618,12 +629,10 @@ with tab2:
 
 with tab3:
     st.subheader("执行合规性分析")
-    
-    # 从已保存的法规中选择
     saved_regs = [r['name'] for r in st.session_state.vector_store.regulations]
     
     if not saved_regs:
-        st.warning("法规库为空，请先在 Tab 1 或 Tab 2 上传/保存法规文件。 ולאחר מכן לחץ על כפתור 'הוסף קבצים' כדי להוסיף אותם למאגר הנתונים.")
+        st.warning("法规库为空，请先在 Tab 1 或 Tab 2 上传/保存法规文件。")
     else:
         selected_reg_names = st.multiselect("选择要分析的法规", saved_regs, default=saved_regs[0] if saved_regs else None)
         
@@ -632,9 +641,7 @@ with tab3:
                 st.error("请至少选择一个法规文件")
                 st.stop()
                 
-            # 获取选中的法规内容
             target_regs = [r for r in st.session_state.vector_store.regulations if r['name'] in selected_reg_names]
-            
             all_clauses = []
             for doc in target_regs:
                 clauses = parse_regulation_clauses(doc['content'])
@@ -643,7 +650,7 @@ with tab3:
                     c['序号'] = i + 1
                     all_clauses.append(c)
             
-            st.info(f"分析中... 共 {len(all_clauses)} 条款")
+            st.info(f"分析中... 共 {len(all_clauses)} 条款 (已启用增量缓存优化)")
             
             results_list = []
             progress_bar = st.progress(0)
@@ -659,7 +666,7 @@ with tab3:
                     completed += 1
                     progress_bar.progress(completed / len(all_clauses))
             
-            st.success("完成!")
+            st.success("完成！")
             results_list.sort(key=lambda x: x['序号'])
             st.session_state.results = pd.DataFrame(results_list)
 
@@ -667,8 +674,8 @@ with tab3:
         df = st.session_state.results
         summary_stats = {
             "total": len(df),
-            "compliant": len(df[df['评价结论'].str.contains("完全符合")]),
-            "partial": len(df[df['评价结论'].str.contains("部分")]),
+            "compliant": len(df[df['评价结论'].str.contains("完全符合")]) ,
+            "partial": len(df[df['评价结论'].str.contains("部分")]) ,
             "non_compliant": len(df[df['评价结论'].str.contains("缺失|不符合")])
         }
         st.dataframe(df)
