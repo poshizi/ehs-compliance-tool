@@ -11,12 +11,13 @@ import numpy as np
 import docx 
 import pickle
 import hashlib
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin, quote
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tenacity import retry, stop_after_attempt, wait_exponential
-from webdavclient3.client import Client as WebDavClient
 
 # ====================
 # Configuration & Constants
@@ -24,6 +25,66 @@ from webdavclient3.client import Client as WebDavClient
 CACHE_DIR = "vector_store_cache"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
+
+# ====================
+# Lightweight WebDAV Client (Dependency-Free)
+# ====================
+
+class SimpleWebDavClient:
+    """基于 requests 的轻量级 WebDAV 客户端"""
+    def __init__(self, base_url, username, password):
+        self.base_url = base_url.rstrip('/') + '/'
+        self.auth = (username, password)
+        self.session = requests.Session()
+        self.session.auth = self.auth
+    
+    def list(self):
+        """列出根目录下的文件"""
+        headers = {'Depth': '1'}
+        try:
+            response = self.session.request('PROPFIND', self.base_url, headers=headers)
+            if response.status_code in [200, 207]:
+                return self._parse_propfind(response.content)
+            else:
+                raise Exception(f"WebDAV Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            raise Exception(f"Connection failed: {str(e)}")
+
+    def download(self, filename):
+        """下载文件内容"""
+        # 拼接 URL，注意处理文件名编码
+        # 简单处理：假设 filename 是相对路径
+        file_url = urljoin(self.base_url, quote(filename))
+        response = self.session.get(file_url)
+        if response.status_code == 200:
+            return response.content
+        else:
+            raise Exception(f"Download failed: {response.status_code}")
+
+    def _parse_propfind(self, xml_content):
+        """解析 XML 响应获取文件名列表"""
+        files = []
+        try:
+            # XML 命名空间处理
+            root = ET.fromstring(xml_content)
+            namespaces = {'d': 'DAV:'}
+            
+            for response in root.findall('d:response', namespaces):
+                href = response.find('d:href', namespaces).text
+                # 解码 URL 编码的字符
+                from urllib.parse import unquote
+                href = unquote(href)
+                
+                # 提取文件名 (简单逻辑)
+                filename = href.rstrip('/').split('/')[-1]
+                
+                # 过滤掉当前目录本身和空名
+                if filename and filename != self.base_url.rstrip('/').split('/')[-1]:
+                    files.append(filename)
+        except Exception as e:
+            print(f"XML Parsing Error: {e}")
+            pass
+        return files
 
 # ====================
 # Core Classes for AI & Data
@@ -107,7 +168,6 @@ class VectorStore:
         self.documents = [] 
         self.vectors = []   
         self.llm_client = None
-        self.index_name = "default_index"
 
     def set_client(self, client):
         self.llm_client = client
@@ -147,10 +207,7 @@ class VectorStore:
             text = file['content']
             name = file['name']
             
-            # 简单的查重 (基于文件名)
-            if any(d['source'] == name for d in self.documents):
-                print(f"Skipping {name}, already exists.")
-                continue
+            if any(d['source'] == name for d in self.documents): continue
 
             for i in range(0, len(text), chunk_size - overlap):
                 chunk = text[i:i + chunk_size]
@@ -168,10 +225,8 @@ class VectorStore:
                 texts_to_embed.append(chunk)
                 start_doc_id += 1
         
-        if not texts_to_embed:
-            return
+        if not texts_to_embed: return
 
-        # 向量化
         if self.llm_client:
             with st.status(f"正在向量化 {len(texts_to_embed)} 个新片段...") as status:
                 new_vectors = [None] * len(texts_to_embed)
@@ -185,21 +240,17 @@ class VectorStore:
                         new_vectors[idx] = vec
                         if vec is not None: success_count += 1
                 
-                # 合并
                 self.documents.extend(new_docs)
                 if len(self.vectors) == 0:
                     self.vectors = new_vectors
                 else:
-                    self.vectors = list(self.vectors) + new_vectors # Convert back to list to extend
+                    self.vectors = list(self.vectors) + new_vectors
                 
                 status.update(label=f"入库完成 (成功率: {success_count}/{len(texts_to_embed)})", state="complete")
 
     def search(self, query_text, top_k=3):
         """混合检索"""
         vec_results = []
-        
-        # 1. 向量检索
-        # 过滤 None 向量
         valid_indices = [i for i, v in enumerate(self.vectors) if v is not None]
         
         if valid_indices and self.llm_client:
@@ -207,30 +258,22 @@ class VectorStore:
             if query_vec is not None:
                 q_v = np.array(query_vec)
                 norm_q = np.linalg.norm(q_v)
-                
-                # 构建矩阵
                 matrix = np.array([self.vectors[i] for i in valid_indices])
                 norm_matrix = np.linalg.norm(matrix, axis=1)
                 
                 if norm_q > 0:
-                    # Cosine Sim
                     scores = np.dot(matrix, q_v) / (norm_matrix * norm_q)
-                    
-                    # 获取 Top K
                     top_k_indices = np.argsort(scores)[-top_k:][::-1]
-                    
                     for idx_in_valid in top_k_indices:
                         real_idx = valid_indices[idx_in_valid]
                         score = scores[idx_in_valid]
                         if score > 0:
                             vec_results.append({'doc': self.documents[real_idx], 'score': float(score), 'method': 'vector'})
 
-        # 2. 关键词检索
         kw_results = []
         query_keywords = [k for k in re.split(r'[，。；：\s]', query_text) if len(k) > 1]
-        
         for doc in self.documents:
-            overlap = sum(1 for k in query_keywords if k in doc['keywords']) # 使用预存的keywords集合加速
+            overlap = sum(1 for k in query_keywords if k in doc['keywords']) 
             if overlap > 0:
                 score = overlap / (len(query_keywords) + 1) * 0.8 
                 kw_results.append({'doc': doc, 'score': score, 'method': 'keyword'})
@@ -249,7 +292,6 @@ class VectorStore:
                 final_results.append({'source': res['doc']['source'], 'content': res['doc']['text'], 'score': res['score']})
                 seen_ids.add(did)
             if len(final_results) >= top_k: break
-                
         return final_results
 
 # ====================
@@ -314,8 +356,7 @@ def evaluate_single_clause(clause, vector_store, llm_client):
     请对给定的法规条款进行合规性评价。严格执行以下思维链：
     1. 解读：理解条款核心要求（人机料法环），判定是否适用于物流仓储企业。如果不适用，直接标记“不适用”。
     2. 比对：对比法规要求与提供的企业制度片段。是否覆盖所有要素？针对物流场景是否具体可执行？
-    3. 判定：给出定性结论。
-    """
+    3. 判定：给出定性结论。"""
     
     user_prompt = f"""
     【法规条款】
@@ -399,20 +440,16 @@ with st.sidebar:
     st.header("1. API 配置")
     llm_base_url = st.text_input("API Base URL", value="https://generativelanguage.googleapis.com/v1beta/openai")
     llm_api_key = st.text_input("API Key", type="password")
-    
     col_m1, col_m2 = st.columns(2)
     with col_m1: llm_model_name = st.text_input("Chat Model", value="gemini-2.0-flash")
     with col_m2: embedding_model_name = st.text_input("Embedding Model", value="text-embedding-004")
     
-    # 初始化 LLM
     if llm_api_key:
         llm_config = {"base_url": llm_base_url, "api_key": llm_api_key, "model": llm_model_name, "embedding_model": embedding_model_name}
         client = LLMClient(llm_config)
         st.session_state.vector_store.set_client(client)
     
     st.divider()
-    
-    # 向量库管理
     st.header("💾 向量库管理")
     db_name = st.text_input("索引名称", value="ehs_master_index")
     col_db1, col_db2 = st.columns(2)
@@ -424,8 +461,7 @@ with st.sidebar:
         if st.button("加载索引"):
             if st.session_state.vector_store.load_from_disk(db_name):
                 st.success(f"已加载! ({len(st.session_state.vector_store.documents)} 片段)")
-            else:
-                st.error("索引文件不存在")
+            else: st.error("索引文件不存在")
 
 st.info(f"当前向量库状态: 包含 {len(st.session_state.vector_store.documents)} 个制度片段")
 
@@ -445,16 +481,15 @@ with tab1:
             st.success("入库完成！请点击侧边栏保存索引。")
 
 with tab2:
-    st.markdown("### 连接到 WebDAV 服务器 (如 Nextcloud/坚果云)")
+    st.markdown("### 连接到 WebDAV 服务器 (如 Nextcloud/坚果云/SharePoint)")
     webdav_url = st.text_input("WebDAV URL", help="e.g. https://dav.jianguoyun.com/dav/")
     webdav_user = st.text_input("Username")
     webdav_pass = st.text_input("Password", type="password")
     
     if st.button("🔗 连接并获取文件列表"):
         try:
-            options = {'webdav_hostname': webdav_url, 'webdav_login': webdav_user, 'webdav_password': webdav_pass}
-            wd_client = WebDavClient(options)
-            files = wd_client.list() # List root
+            wd_client = SimpleWebDavClient(webdav_url, webdav_user, webdav_pass)
+            files = wd_client.list()
             st.session_state.webdav_files = [f for f in files if f.endswith(('.docx', '.zip', '.xlsx'))]
             st.session_state.wd_client = wd_client
             st.success(f"成功连接！发现 {len(st.session_state.webdav_files)} 个支持的文件。")
@@ -462,22 +497,15 @@ with tab2:
             st.error(f"连接失败: {e}")
 
     if 'webdav_files' in st.session_state:
-        selected_files = st.multiselect("选择要分析的法规/制度文件", st.session_state.webdav_files)
-        file_type = st.radio("这些文件是:", ["制度 (加入向量库)", "法规 (用于分析)"])
+        selected_files = st.multiselect("选择文件", st.session_state.webdav_files)
+        file_type = st.radio("文件用途:", ["制度 (加入向量库)", "法规 (用于分析)"])
         
         if st.button("⬇️ 下载并处理选定文件"):
             downloaded_corpus = []
             for fname in selected_files:
                 try:
-                    # WebDAV download to memory
                     with st.spinner(f"正在下载 {fname}..."):
-                        # webdavclient3 download_from returns None, writes to file. We need bytes.
-                        # Using buffer
-                        buff = io.BytesIO()
-                        st.session_state.wd_client.download_from(fname, buff)
-                        buff.seek(0)
-                        content = buff.read()
-                        
+                        content = st.session_state.wd_client.download(fname)
                         text = extract_text_from_content(fname, content)
                         if text: downloaded_corpus.append({'name': fname, 'content': text})
                 except Exception as e:
@@ -495,7 +523,6 @@ with tab3:
     st.markdown("数据源: **已加载的向量库** (制度) vs **上传/选定的法规文件**")
     
     if st.button("🚀 开始专家级评估", type="primary"):
-        # 准备法规
         reg_corpus = []
         if reg_files_local:
             for name, content in process_uploaded_files(reg_files_local):
@@ -510,10 +537,9 @@ with tab3:
             st.stop()
             
         if len(st.session_state.vector_store.documents) == 0:
-            st.error("向量库为空！请先上传制度文件并入库。" )
+            st.error("向量库为空！请先上传制度文件并入库。")
             st.stop()
             
-        # 解析法规
         all_clauses = []
         for doc in reg_corpus:
             clauses = parse_regulation_clauses(doc['content'])
@@ -524,7 +550,6 @@ with tab3:
                 
         st.info(f"共识别出 {len(all_clauses)} 条法规条款，开始分析...")
         
-        # 并发执行
         results_list = []
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -553,7 +578,6 @@ with tab3:
             "partial": len(df[df['评价结论'].str.contains("部分")]) ,
             "non_compliant": len(df[df['评价结论'].str.contains("缺失|不符合")])
         }
-        
         st.dataframe(df)
         word_file = generate_word_report(df, summary_stats)
         st.download_button("📥 下载 Word 报告", word_file, "EHS_Report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
