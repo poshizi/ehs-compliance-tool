@@ -296,7 +296,7 @@ def evaluate_single_clause(clause, vector_store, llm_client):
         evidence_text += f"片段 {i+1} (相似度: {res['score']:.2f}):\n{res['content']}\n---\n"
     
     system_prompt = "你是一个EHS合规专家。请对比法规条款和企业制度，判断是否合规。"
-    user_prompt = f"【法规条款】\n{clause['法规正文']}\n\n【企业制度参考片段】\n{evidence_text}\n\n请基于上述片段判断。若符合，引用原文。\n返回JSON:\n{{\n    "status": "✅完全符合" 或 "⚠️部分符合/需完善" 或 "❌缺失/不符合",\n    "evidence": "制度原文引用",\n    "reason": "判定理由"\n}}"
+    user_prompt = f"【法规条款】\n{clause['法规正文']}\n\n【企业制度参考片段】\n{evidence_text}\n\n请基于上述片段判断。若符合，引用原文。\n返回JSON:\n{{\n    \"status\": \"完全符合\" 或 \"部分符合/需完善\" 或 \"缺失/不符合\",\n    \"evidence\": \"制度原文引用\",\n    \"reason\": \"判定理由\"\n}}"
     
     try:
         result = llm_client.chat_completion(system_prompt, user_prompt)
