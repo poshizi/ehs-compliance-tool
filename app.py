@@ -5,6 +5,8 @@ import re
 import zipfile
 import io
 import time
+import requests
+import json
 
 # ====================
 # 核心逻辑函数 (复用专家经验)
@@ -92,6 +94,76 @@ def calculate_match_score(clause_text, policy_text):
             
     return score, list(set(matched_words))
 
+def check_llm_compliance(clause, policy_candidates, api_config):
+    """
+    使用大模型进行合规性判定
+    clause: {条款号, 法规正文}
+    policy_candidates: [{name, content, score}, ...] (Top N candidates)
+    api_config: {base_url, api_key, model}
+    """
+    if not api_config.get('api_key'):
+        return None
+
+    # 构造 Prompt
+    candidates_text = ""
+    for i, p in enumerate(policy_candidates):
+        # 截取相关性最高的片段 (简单处理：取前1000字符或关键词附近，这里暂取前1500字符以节省token)
+        # 实际生产中应使用向量检索配合RAG，这里基于关键词匹配结果做简单上下文填充
+        content_snippet = p['content'][:2000] + "..." 
+        candidates_text += f"Document {i+1} [{p['name']}]:\n{content_snippet}\n\n"
+
+    system_prompt = "你是一位资深的EHS合规性审计专家。你的任务是根据提供的企业内部制度文档，判断其是否符合给定的法规条款要求。"
+    user_prompt = f"""
+请分析以下法规条款与企业制度的符合情况：
+
+【法规条款】
+{clause['法规正文']}
+
+【企业内部制度参考】
+{candidates_text}
+
+【任务要求】
+1. 判断企业制度是否覆盖并符合该条款要求。
+2. 给出评价结论，必须从以下选项中选择一个： "✅完全符合", "⚠️部分符合/需完善", "❌缺失/不符合", "❗不适用"。
+3. 提供支撑证据，引用具体的制度名称和关键内容。
+4. 如果条款主要涉及政府监管职责而非企业义务，请标注为 "❗不适用"。
+
+请以JSON格式返回结果，格式如下：
+{{
+  "compliance_status": "评价结论",
+  "evidence": "支撑证据(简练概括)",
+  "reasoning": "判定理由"
+}}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {api_config['api_key']}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": api_config['model'],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"}
+    }
+
+    try:
+        response = requests.post(f"{api_config['base_url']}/chat/completions", headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            return json.loads(content)
+        else:
+            st.warning(f"LLM API请求失败: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        st.warning(f"LLM调用异常: {str(e)}")
+        return None
+
 def generate_markdown_report(summary_data, df_result):
     """生成 Markdown 格式的报告"""
     report = f"""# EHS法规合规性评价报告
@@ -129,7 +201,7 @@ def generate_markdown_report(summary_data, df_result):
         
     return report
 
-def analyze_compliance(reg_files, policy_files, progress_bar, status_text):
+def analyze_compliance(reg_files, policy_files, progress_bar, status_text, llm_config=None):
     """执行合规性分析的主流程"""
     
     # 1. 预处理制度文件库
@@ -181,38 +253,57 @@ def analyze_compliance(reg_files, policy_files, progress_bar, status_text):
                 "匹配度": 0
             }
             
-            if clause['适用性'] != "适用":
-                row['评价结论'] = "❗不适用"
-                row['支撑证据'] = "条款主体非企业"
+            # 第一步：关键词初筛 (找到Top 3候选制度)
+            candidates = []
+            for policy in policy_corpus:
+                score, keywords = calculate_match_score(clause['法规正文'], policy['content'])
+                if score > 0:
+                    candidates.append({
+                        "name": policy['name'],
+                        "content": policy['content'],
+                        "score": score,
+                        "keywords": keywords
+                    })
+            
+            # 按分数排序取前3
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            top_candidates = candidates[:3]
+            
+            # 第二步：判定逻辑 (LLM vs 规则)
+            llm_result = None
+            if llm_config and llm_config.get('api_key') and clause['适用性'] == "适用":
+                # 使用 LLM 进行精准判定
+                status_text.text(f"正在分析 {r_name}: {clause['条款号']} (AI思考中...)")
+                llm_result = check_llm_compliance(clause, top_candidates, llm_config)
+            
+            if llm_result:
+                # 采纳 LLM 结果
+                row['评价结论'] = llm_result.get('compliance_status', "❌缺失/不符合")
+                row['支撑证据'] = llm_result.get('evidence', "") + f"\n(AI理由: {llm_result.get('reasoning', '')})"
             else:
-                # 在制度库中寻找最佳匹配
-                best_score = 0
-                best_match = None
-                best_keywords = []
-                
-                for policy in policy_corpus:
-                    score, keywords = calculate_match_score(clause['法规正文'], policy['content'])
-                    if score > best_score:
-                        best_score = score
-                        best_match = policy
-                        best_keywords = keywords
-                
-                # 判定逻辑
-                if best_score > 0:
+                # 降级回退到 规则判定
+                if clause['适用性'] != "适用":
+                    row['评价结论'] = "❗不适用"
+                    row['支撑证据'] = "条款主体非企业"
+                elif top_candidates:
+                    best_match = top_candidates[0]
+                    best_score = best_match['score']
+                    best_keywords = best_match['keywords']
+                    
                     row['匹配度'] = best_score
                     # 提取匹配片段
-                    idx = best_match['content'].find(best_keywords[0])
+                    idx = best_match['content'].find(best_keywords[0]) if best_keywords else 0
                     start = max(0, idx - 20)
                     end = min(len(best_match['content']), idx + 100)
                     snippet = best_match['content'][start:end] + "..."
                     
                     row['支撑证据'] = f"[{best_match['name']}]\n相关内容: ...{snippet}"
                     
-                    if best_score > 30: # 阈值可调
+                    if best_score > 30: 
                         row['评价结论'] = "✅完全符合"
                     elif best_score > 10:
                         row['评价结论'] = "⚠️部分符合/需完善"
-                
+
             current_results.append(row)
         
         all_results.extend(current_results)
@@ -231,7 +322,7 @@ st.markdown("""
 请在左侧侧边栏上传相应的文件。
 """)
 
-# --- 侧边栏：文件上传 ---
+# --- 侧边栏：文件上传与配置 ---
 with st.sidebar:
     st.header("📂 文件上传区")
     
@@ -240,6 +331,21 @@ with st.sidebar:
     
     st.subheader("2. 上传制度文件 (依据)")
     policy_files = st.file_uploader("支持 .docx, .xlsx, .zip (如: 管理手册)", type=['docx', 'xlsx', 'zip'], accept_multiple_files=True, key="pol")
+    
+    st.divider()
+    
+    st.header("🤖 AI大模型配置 (可选)")
+    st.info("配置大模型可显著提升分析准确度，支持 Gemini 或 OpenAI 格式 API。")
+    
+    llm_base_url = st.text_input("API Base URL", value="https://generativelanguage.googleapis.com/v1beta/openai/", help="例如: https://api.openai.com/v1 或 Gemini 的 OpenAI 兼容端点")
+    llm_api_key = st.text_input("API Key", type="password", help="在此处输入您的 API Key")
+    llm_model_name = st.text_input("Model Name", value="gemini-2.0-flash", help="例如: gemini-2.0-flash, gpt-4o")
+    
+    llm_config = {
+        "base_url": llm_base_url.rstrip('/'),
+        "api_key": llm_api_key,
+        "model": llm_model_name
+    }
     
     st.info("提示：支持批量上传或ZIP压缩包。文件越多，分析时间越长，请耐心等待。")
 
@@ -253,7 +359,7 @@ if reg_files and policy_files:
         
         try:
             # 执行分析
-            df_result = analyze_compliance(reg_files, policy_files, progress_bar, status_text)
+            df_result = analyze_compliance(reg_files, policy_files, progress_bar, status_text, llm_config)
             
             status_text.text("✅ 分析完成！")
             progress_bar.progress(100)
